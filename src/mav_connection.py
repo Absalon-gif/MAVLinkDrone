@@ -2,8 +2,7 @@ import socket
 import threading
 import time
 import struct
-from src.mav_message import MAVLinkChecksum
-
+from src.mav_message import MAVLinkChecksum, MAVLinkSerializer, MAVLinkMessageCreator, MAVLinkMessage
 
 # MAVLink constants
 START_BYTE = 0xFE
@@ -13,6 +12,15 @@ SEQUENCE = 0
 
 BUFFER_SIZE = 1024
 
+heartbeat_values = {
+    'type': 2,  # MAV_TYPE: Generic micro air vehicle
+    'autopilot': 1,  # MAV_AUTOPILOT: Reserved for future use.
+    'base_mode': 0,  # MAV_MODE_FLAG: (Bitmask) These flags encode the MAV mode.
+    'custom_mode': 1,  # A bitfield for use for autopilot-specific flags
+    'system_status': 1,  # MAV_STATE: System status flag.
+    'mavlink_version': 3  # MAVLink version
+}
+
 
 class MAVLinkSocket:
     def __init__(self, host: str, port: int, broadcast_port: int):
@@ -21,16 +29,20 @@ class MAVLinkSocket:
         self.broadcast_port = broadcast_port
         self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.udp_socket.bind((self.host, self.port))
-        self.gcs_ip = None
-        self.gcs_port = None
         self.access_control = AccessControl()
 
     def broadcast_address(self):
         broadcast_address = ('<broadcast>', self.broadcast_port)
         self.udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        authorized_system_ids = [0, 5]
-        message = f"{authorized_system_ids}".encode()
+        message = f'{SYSTEM_ID}'.encode('utf-8')
         self.udp_socket.sendto(message, broadcast_address)
+
+    def send_datagram(self, data: bytes, target_host: str, target_port: str) -> None:
+        try:
+            if self.udp_socket:
+                self.udp_socket.sendto(data, (target_host, target_port))
+        except socket.error as e:
+            print(f"Socket error: {e}")
 
     def recv_datagram(self):
         if self.udp_socket:
@@ -56,41 +68,89 @@ class MAVLinkSocket:
 
 
 class MAVLinkSocketHandler:
-    def __init__(self, bind_ip, bind_port, remote_port):
-        self.drone_socket = MAVLinkSocket(bind_ip, bind_port, remote_port)
+    def __init__(self, bind_ip, bind_port, remote_port, drone):
+        self.drone_socket = MAVLinkSocket(host=bind_ip, port=bind_port, broadcast_port=remote_port)
         self.broadcasting = True
-        self.stop_event = threading.Event()
         self.listen_thread = threading.Thread(target=self.listen_for_datagrams)
-        self.broadcast_thread = threading.Thread(target=self.broadcast_address)
+        self.heartbeat_thread = None
+        self.gcs_ip = None
+        self.gcs_port = None
+        self.drone = drone
 
     def start(self):
         self.listen_thread.start()
-        self.broadcast_thread.start()
-        self.listen_thread.join()
-        self.broadcast_thread.join()
+        self.broadcast_address()
+        try:
+            self.listen_thread.join()
+        except KeyboardInterrupt:
+            print("Stopping Listening.")
 
     def broadcast_address(self):
-        while not self.stop_event.is_set():
-            self.drone_socket.broadcast_address()
-            print("Sent broadcast message")
-            time.sleep(2)
+        while self.broadcasting:
+            try:
+                self.drone_socket.broadcast_address()
+                print("Sent broadcast message")
+                time.sleep(2)
+            except Exception as e:
+                print(f"Error sending broadcast: {e}")
+
+    def enable_drone(self):
+        from src.Drone_sim import Drone
+        # Setting the drone to alive
+        Drone.set_drone_active(self.drone)
+        if not self.heartbeat_thread or not self.heartbeat_thread.is_alive():
+            self.heartbeat_thread = threading.Thread(target=self.send_heartbeat)
+            self.heartbeat_thread.start()
 
     def listen_for_datagrams(self):
+        operations_executed = False
+
         while True:
             data, addr = self.drone_socket.recv_datagram()
+            self.gcs_ip, self.gcs_port = addr
             if data:
                 print("Received datagram:", data, "from", addr)
                 self.receive_message(data)
-                self.stop_event.set()
-                self.broadcasting = False
+                if not operations_executed:
+                    self.enable_drone()
+                    self.broadcasting = False
+                    operations_executed = True
+                    print("Stopping broadcast")
+
+    def send_message(self, message: MAVLinkMessage, values: dict) -> None:
+        serializer = MAVLinkSerializer(message)
+        payload = serializer.serialize(values)
+
+        # packet creation
+        length = len(payload)
+        msg_id = message.message_id
+        header = struct.pack('<BBBBBB', START_BYTE, length, SEQUENCE, SYSTEM_ID, COMPONENT_ID, msg_id)
+
+        # Compute Checksum
+        checksum = MAVLinkChecksum(message).compute(header[1:] + payload)
+        checksum_bytes = struct.pack('<B', checksum)
+
+        mavlink_packet = header + payload + checksum_bytes
+
+        print("Bytes Sent:", len(mavlink_packet))
+
+        hex_string = ' '.join(format(byte, '02x') for byte in mavlink_packet)
+        print("Datagram:", hex_string)
+        self.drone_socket.send_datagram(mavlink_packet, self.gcs_ip, self.gcs_port)
+        print(f"Sent to address:{self.gcs_ip}:{self.gcs_port}")
+
+    def send_heartbeat(self):
+        mav_message = MAVLinkMessageCreator().create_message(0)
+        while self.drone.alive is True:
+            try:
+                self.send_message(mav_message, heartbeat_values)
+                time.sleep(30)
+                print("Heartbeat sent")
+            except Exception as e:
+                print(f"Error sending heartbeat: {e}")
 
     @staticmethod
     def receive_message(data):
-        print(f"Bytes Received: {len(data)}")
-
-        hex_string = ' '.join(format(byte, '02x') for byte in data)
-        print(f"Datagram: {hex_string}")
-
         if len(data) < 8:
             print("Invalid packet length")
             return
@@ -98,8 +158,15 @@ class MAVLinkSocketHandler:
         start_byte, length, sequence, system_id, component_id, msg_id = struct.unpack('<BBBBBB', data[:6])
 
         if start_byte == START_BYTE:
-            payload = data[6:6 + length]
-            received_checksum = data[6+length]
+            print(f"Bytes Received: {len(data)}")
+
+            hex_string = ' '.join(format(byte, '02x') for byte in data)
+            print(f"Datagram: {hex_string}")
+
+            mav_message = MAVLinkMessageCreator().create_message(msg_id)
+            serializer = MAVLinkSerializer(mav_message)
+            payload = serializer.deserialize(data[6:6 + length])
+            received_checksum = data[6 + length]
 
             computed_checksum = MAVLinkChecksum.compute(data[1:6 + length])
 

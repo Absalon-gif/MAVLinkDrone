@@ -1,5 +1,6 @@
-from src.mav_connection import MAVLinkSocketHandler
+import time
+from src.Drone_sim import Drone
 
 if __name__ == "__main__":
-    handler = MAVLinkSocketHandler('0.0.0.0', 50000, 50001)
-    handler.start()
+    drone = Drone(latitude=-33.918861, longitude=18.4233)
+    drone.start_drone()

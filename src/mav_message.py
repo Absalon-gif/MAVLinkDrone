@@ -46,6 +46,11 @@ class MAVLinkSerializer:
         payload = struct.pack(format_string, *[values[f.name] for f in self.message.fields])
         return payload
 
+    def deserialize(self, payload: bytes):
+        format_string = '<' + ''.join([self._get_format(f.field_type) for f in self.message.fields])
+        unpacked_values = struct.unpack(format_string, payload)
+        return {f.name: value for f, value in zip(self.message.fields, unpacked_values)}
+
     # Got this from https://mavlink.io/en/guide/serialization.html
     @staticmethod
     def _get_format(field_type: str) -> str:
@@ -61,6 +66,16 @@ class MAVLinkSerializer:
             'char': 'c'
         }
         return formats[field_type]
+
+
+class MAVLinkMessageCreator:
+    def __init__(self):
+        self.parser = MAVLinkXMLParser()
+
+    def create_message(self, msg_id):
+        messages = self.parser.parse_file('message_definitions/common.xml')
+        mav_message = next(mav_message for mav_message in messages if mav_message.message_id == msg_id)
+        return mav_message
 
 
 class MAVLinkChecksum:
