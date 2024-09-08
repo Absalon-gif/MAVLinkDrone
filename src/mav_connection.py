@@ -21,6 +21,10 @@ heartbeat_values = {
     'mavlink_version': 3  # MAVLink version
 }
 
+CRC_EXTRA_CONSTANTS = {
+    0: 50  # HEARTBEAT
+}
+
 
 class MAVLinkSocket:
     def __init__(self, host: str, port: int, broadcast_port: int):
@@ -127,8 +131,10 @@ class MAVLinkSocketHandler:
         header = struct.pack('<BBBBBB', START_BYTE, length, SEQUENCE, SYSTEM_ID, COMPONENT_ID, msg_id)
 
         # Compute Checksum
-        checksum = MAVLinkChecksum(message).compute(header[1:] + payload)
-        checksum_bytes = struct.pack('<B', checksum)
+        # Compute Checksum
+        crc_extra = CRC_EXTRA_CONSTANTS.get(msg_id, 0)
+        checksum = MAVLinkChecksum.compute(header[1:] + payload, crc_extra)
+        checksum_bytes = struct.pack('<H', checksum)
 
         mavlink_packet = header + payload + checksum_bytes
 
@@ -164,11 +170,18 @@ class MAVLinkSocketHandler:
             print(f"Datagram: {hex_string}")
 
             mav_message = MAVLinkMessageCreator().create_message(msg_id)
+
+            if mav_message is None:
+                print("Message ID not recognized")
+                return
+
             serializer = MAVLinkSerializer(mav_message)
             payload = serializer.deserialize(data[6:6 + length])
             received_checksum = data[6 + length]
 
-            computed_checksum = MAVLinkChecksum.compute(data[1:6 + length])
+            crc_extra = CRC_EXTRA_CONSTANTS.get(msg_id, 0)
+            checksum_data = data[1:6 + length]
+            computed_checksum = MAVLinkChecksum.compute(checksum_data, crc_extra)
 
             if received_checksum == computed_checksum:
                 print(f"Received packet: SYS: {system_id}, COMP: {component_id}, LEN: {length}, MSG ID: {msg_id}, "

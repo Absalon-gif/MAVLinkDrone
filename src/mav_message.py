@@ -79,10 +79,23 @@ class MAVLinkMessageCreator:
 
 
 class MAVLinkChecksum:
-    def __init__(self, message: MAVLinkMessage):
-        self.message = message
+    def __init__(self):
+        self.starting_value = 0xFFFF
+        self.mav_polynomial = 0x1021
 
     @staticmethod
-    def compute(data: bytes) -> int:
-        checksum = sum(data) % 256
-        return checksum
+    def compute(data: bytes, crc_extra: int) -> int:
+        crc = 0xFFFF
+        for byte in data:
+            crc ^= byte << 8
+            for _ in range(8):
+                if crc & 0x8000:
+                    crc = (crc << 1) ^ 0x1021
+                else:
+                    crc <<= 1
+                crc &= 0xFFFF  # Keep CRC within 16 bits
+
+        # Apply the CRC extra to the final checksum
+        crc = (crc ^ crc_extra) & 0xFF
+
+        return crc
