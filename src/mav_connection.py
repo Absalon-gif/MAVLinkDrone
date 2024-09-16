@@ -2,6 +2,11 @@ import socket
 import threading
 import time
 import struct
+
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+from cryptography.hazmat.backends import default_backend
+import os
+
 from src.mav_message import MAVLinkChecksum, MAVLinkSerializer, MAVLinkMessageCreator, MAVLinkMessage
 
 # MAVLink constants
@@ -24,6 +29,8 @@ heartbeat_values = {
 CRC_EXTRA_CONSTANTS = {
     0: 50  # HEARTBEAT
 }
+
+STATIC_KEY = None
 
 
 class MAVLinkSocket:
@@ -51,12 +58,16 @@ class MAVLinkSocket:
     def recv_datagram(self):
         if self.udp_socket:
             data, addr = self.udp_socket.recvfrom(BUFFER_SIZE)
-            system_id = self.parse_system_id(data)
-            if self.access_control.is_authorized(system_id):
+            if STATIC_KEY is None:
+                self.parse_static_key(data)
                 return data, addr
             else:
-                print(f"Access denied for system ID {system_id}")
-                return None, None
+                system_id = self.parse_system_id(data)
+                if self.access_control.is_authorized(system_id):
+                    return data, addr
+                else:
+                    print(f"Access denied for system ID {system_id}")
+                    return None, None
         else:
             raise ConnectionError("UDP socket is not connected")
 
@@ -69,6 +80,14 @@ class MAVLinkSocket:
             return sys_id
         else:
             return None
+
+    @staticmethod
+    def parse_static_key(data: bytes):
+        start_byte = data[0]
+        global STATIC_KEY
+        if start_byte == 1:
+            static_key = data[1:]
+            STATIC_KEY = static_key
 
 
 class MAVLinkSocketHandler:
@@ -112,7 +131,7 @@ class MAVLinkSocketHandler:
         while True:
             data, addr = self.drone_socket.recv_datagram()
             self.gcs_ip, self.gcs_port = addr
-            if data:
+            if data and (data[0] == START_BYTE):
                 print("Received datagram:", data, "from", addr)
                 self.receive_message(data)
                 if not operations_executed:
@@ -121,22 +140,29 @@ class MAVLinkSocketHandler:
                     operations_executed = True
                     print("Stopping broadcast")
 
-    def send_message(self, message: MAVLinkMessage, values: dict) -> None:
+    def send_message(self, message: MAVLinkMessage, values: dict, encrypted) -> None:
         serializer = MAVLinkSerializer(message)
         payload = serializer.serialize(values)
 
-        # packet creation
-        length = len(payload)
+        mav_message = payload
+
+        if encrypted:
+            # Encrypt message
+            encryptor = MAVLinkSec(STATIC_KEY)
+            mav_message = encryptor.encrypt_chacha20(payload)
+
+        # Packet creation
+        length = len(mav_message)
         msg_id = message.message_id
         header = struct.pack('<BBBBBB', START_BYTE, length, SEQUENCE, SYSTEM_ID, COMPONENT_ID, msg_id)
 
         # Compute Checksum
         # Compute Checksum
         crc_extra = CRC_EXTRA_CONSTANTS.get(msg_id, 0)
-        checksum = MAVLinkChecksum.compute(header[1:] + payload, crc_extra)
+        checksum = MAVLinkChecksum().compute(header[1:] + mav_message, crc_extra)
         checksum_bytes = struct.pack('<H', checksum)
 
-        mavlink_packet = header + payload + checksum_bytes
+        mavlink_packet = header + mav_message + checksum_bytes
 
         print("Bytes Sent:", len(mavlink_packet))
 
@@ -149,9 +175,14 @@ class MAVLinkSocketHandler:
         mav_message = MAVLinkMessageCreator().create_message(0)
         while self.drone.alive is True:
             try:
-                self.send_message(mav_message, heartbeat_values)
-                time.sleep(30)
-                print("Heartbeat sent")
+                if STATIC_KEY is None:
+                    self.send_message(mav_message, heartbeat_values, False)
+                    time.sleep(30)
+                    print("Heartbeat sent")
+                else:
+                    self.send_message(mav_message, heartbeat_values, True)
+                    time.sleep(30)
+                    print("Heartbeat sent")
             except Exception as e:
                 print(f"Error sending heartbeat: {e}")
 
@@ -175,13 +206,19 @@ class MAVLinkSocketHandler:
                 print("Message ID not recognized")
                 return
 
+            received_payload = data[6:6 + length]
+            # Decrypt message
+            if length > 10:  # if length is greater than 10 for now, it means that the message is encrypted
+                decryptor = MAVLinkSec(STATIC_KEY)
+                received_payload = decryptor.decrypt_chacha20(data[6:6 + length])
+
             serializer = MAVLinkSerializer(mav_message)
-            payload = serializer.deserialize(data[6:6 + length])
+            payload = serializer.deserialize(received_payload)
             received_checksum = data[6 + length]
 
             crc_extra = CRC_EXTRA_CONSTANTS.get(msg_id, 0)
             checksum_data = data[1:6 + length]
-            computed_checksum = MAVLinkChecksum.compute(checksum_data, crc_extra)
+            computed_checksum = MAVLinkChecksum().compute(checksum_data, crc_extra)
 
             if received_checksum == computed_checksum:
                 print(f"Received packet: SYS: {system_id}, COMP: {component_id}, LEN: {length}, MSG ID: {msg_id}, "
@@ -207,3 +244,52 @@ class AccessControl:
 
     def has_authorized_ids(self) -> bool:
         return len(self.authorized_system_ids) > 0
+
+
+class MAVLinkSec:
+    def __init__(self, key=STATIC_KEY):
+        self.key = key
+
+    def encrypt_chacha20(self, payload):
+        nonce = os.urandom(16)
+
+        algorithm = algorithms.ChaCha20(self.key, nonce)
+        cipher = Cipher(algorithm, mode=None, backend=default_backend())
+        encryptor = cipher.encryptor()
+        ciphertext = encryptor.update(payload)
+
+        return nonce + ciphertext
+
+    def decrypt_chacha20(self, encrypted_message):
+        nonce = encrypted_message[:16]
+        ciphertext = encrypted_message[16:]
+
+        algorithm = algorithms.ChaCha20(self.key, nonce)
+        cipher = Cipher(algorithm, mode=None, backend=default_backend())
+        decryptor = cipher.decryptor()
+        decrypted_message = decryptor.update(ciphertext)
+
+        return decrypted_message
+
+    def aes_encrypt(self, payload):
+        nonce = os.urandom(16)
+
+        algorithm = algorithms.AES(self.key)
+        cipher = Cipher(algorithm, modes.CTR(nonce), backend=default_backend())
+
+        encryptor = cipher.encryptor()
+        ciphertext = encryptor.update(payload) + encryptor.finalize()
+
+        return nonce + ciphertext
+
+    def aes_decrypt(self, cipher_message):
+        nonce = cipher_message[:16]
+        encrypted_message = cipher_message[16:]
+
+        algorithm = algorithms.AES(self.key)
+        cipher = Cipher(algorithm, modes.CTR(nonce), backend=default_backend())
+
+        decrypt = cipher.decryptor()
+        decrypted_message = decrypt.update(encrypted_message) + decrypt.finalize()
+
+        return decrypted_message
