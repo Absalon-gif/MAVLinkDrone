@@ -11,7 +11,7 @@ from src.mav_message import MAVLinkChecksum, MAVLinkSerializer, MAVLinkMessageCr
 
 # MAVLink constants
 START_BYTE = 0xFE
-SYSTEM_ID = 0
+SYSTEM_ID = 1  # Can't use Zero as it is the broadcast address
 COMPONENT_ID = 1
 SEQUENCE = 0
 
