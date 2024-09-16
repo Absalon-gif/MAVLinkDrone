@@ -83,19 +83,16 @@ class MAVLinkChecksum:
         self.starting_value = 0xFFFF
         self.mav_polynomial = 0x1021
 
-    @staticmethod
-    def compute(data: bytes, crc_extra: int) -> int:
-        crc = 0xFFFF
+    def compute(self, data: bytes, crc_extra: int) -> int:
+        crc = self.starting_value
         for byte in data:
             crc ^= byte << 8
             for _ in range(8):
                 if crc & 0x8000:
-                    crc = (crc << 1) ^ 0x1021
+                    crc = (crc << 1) ^ self.mav_polynomial
                 else:
                     crc <<= 1
                 crc &= 0xFFFF  # Keep CRC within 16 bits
 
-        # Apply the CRC extra to the final checksum
         crc = (crc ^ crc_extra) & 0xFF
-
         return crc
